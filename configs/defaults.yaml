@@ -1,0 +1,22 @@
+label_column: possession_outcome
+id_column: possession_id
+game_column: game_id
+horizons:
+  - 2
+  - 4
+  - 6
+  - 8
+classes:
+  - made_2
+  - made_3
+  - missed_shot
+  - turnover
+  - free_throws
+lstm:
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.2
+  batch_size: 64
+  epochs: 10
+  learning_rate: 0.001
+
