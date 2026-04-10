@@ -1,8 +1,11 @@
 .DS_Store
+.hf-cache/
+.pip-cache/
 .swift-cache/
 __pycache__/
 .pycache/
 .pytest_cache/
+.ropeproject/
 .mypy_cache/
 .ruff_cache/
 .venv/

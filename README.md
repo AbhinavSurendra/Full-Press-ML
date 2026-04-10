@@ -16,7 +16,7 @@ The main analytical question is: **how early in a possession can the final outco
 
 ## Tech Stack
 
-- Python 3.11+
+- Python 3.9+
 - PyTorch
 - pandas / numpy
 - scikit-learn
@@ -95,28 +95,50 @@ The tiny split contains `5` games, which is enough to validate the pipeline befo
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e '.[dev]'
 ```
 
-Baseline pipeline:
+## Pipeline Entry Points
+
+The repository uses a split between:
+
+- `src/full_press_ml/...` for implementation code
+- `scripts/...` for thin CLI wrappers that call into the package
+
+For example, `scripts/build_possessions.py` is just a command-line entrypoint for `src/full_press_ml/data/build_possessions.py`. Both are intentional and should stay aligned.
+
+## Current Pipeline Commands
+
+Standard processed dataset:
 
 ```bash
-python scripts/build_possessions.py --input data/raw/tracking.csv --output data/processed/possessions.csv
-python scripts/train_baseline.py --data data/processed/possessions.csv
+python scripts/build_possessions.py \
+  --games-dir data/raw/tiny/games \
+  --pbp data/raw/tiny/2015-16_pbp.csv \
+  --output-dir data/processed/standard
+```
+
+Rich tracking export:
+
+```bash
+python scripts/build_rich_tracking.py \
+  --games-dir data/raw/tiny/games \
+  --pbp data/raw/tiny/2015-16_pbp.csv \
+  --output-dir data/processed/rich
 ```
 
 Sequence model:
 
 ```bash
-python scripts/train_lstm.py --data data/processed/possessions.csv
+python scripts/train_lstm.py --data data/processed/standard/frames.csv --label-column label_id
 ```
 
 ## Recommended Execution Order
 
-1. Finish the possession extraction pipeline.
-2. Validate the 5-class labeling scheme.
-3. Build tabular features and train the baseline models.
-4. Train the PyTorch LSTM on possession prefixes.
+1. Build normalized event, frame, and possession tables from raw games plus play-by-play.
+2. Validate the possession segmentation and 5-class labeling scheme.
+3. Add label ids and feature preprocessing for model-ready datasets.
+4. Train baseline tabular models and the PyTorch LSTM on possession prefixes.
 5. Compare horizon-based results and write up the analysis.
 
-See [PROJECT_PLAN.md](/Users/abhinavsurendra/Documents/Important/Work/GitHub%20Projects/Full%20Press%20ML/PROJECT_PLAN.md) and the files in [tasks](/Users/abhinavsurendra/Documents/Important/Work/GitHub%20Projects/Full%20Press%20ML/tasks) for the work breakdown.
+See [PIPELINE_OVERVIEW.md](/Users/abhinavsurendra/Documents/Important/Work/GitHub%20Projects/Full%20Press%20ML/PIPELINE_OVERVIEW.md) for the current pipeline design, remaining gaps, and model-ingestion notes. See [PROJECT_PLAN.md](/Users/abhinavsurendra/Documents/Important/Work/GitHub%20Projects/Full%20Press%20ML/PROJECT_PLAN.md) and the files in [tasks](/Users/abhinavsurendra/Documents/Important/Work/GitHub%20Projects/Full%20Press%20ML/tasks) for the work breakdown.
