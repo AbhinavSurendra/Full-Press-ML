@@ -11,6 +11,7 @@ requires-python = ">=3.9"
 dependencies = [
   "numpy>=1.26",
   "pandas>=2.2",
+  "py7zr>=0.22",
   "scikit-learn>=1.5",
   "torch>=2.3",
   "xgboost>=2.1",
