@@ -30,9 +30,10 @@ class PossessionSequenceDataset(Dataset):
         self.label_column = label_column
         self.max_len = max_len
         self.examples = []
+        sort_column = "possession_frame_idx" if "possession_frame_idx" in frame_table.columns else "frame_idx"
 
-        for _, group in frame_table.groupby("possession_id"):
-            group = group.sort_values("frame_idx").head(max_len)
+        for _, group in frame_table.groupby(["game_id", "possession_id"]):
+            group = group.sort_values(sort_column).head(max_len)
             sequence = group[feature_columns].to_numpy(dtype=np.float32)
             label = int(group[label_column].iloc[-1])
             self.examples.append((sequence, label))
@@ -45,4 +46,3 @@ class PossessionSequenceDataset(Dataset):
         padded = np.zeros((self.max_len, len(self.feature_columns)), dtype=np.float32)
         padded[: len(sequence)] = sequence
         return torch.from_numpy(padded), torch.tensor(label, dtype=torch.long)
-

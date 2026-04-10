@@ -46,7 +46,9 @@ def main() -> None:
 
     frame_table = pd.read_csv(args.data)
     feature_columns = [
-        col for col in frame_table.columns if col not in {"game_id", "possession_id", "frame_idx", args.label_column}
+        col
+        for col in frame_table.columns
+        if col not in {"game_id", "possession_id", "frame_idx", "possession_frame_idx", args.label_column}
     ]
     dataset = PossessionSequenceDataset(
         frame_table=frame_table,
@@ -73,4 +75,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
