@@ -93,9 +93,14 @@ The tiny split contains `5` games, which is enough to validate the pipeline befo
 ## Quick Start
 
 ```bash
-python -m venv .venv
+./scripts/setup_venv.sh
 source .venv/bin/activate
-pip install -e '.[dev]'
+```
+
+If you prefer not to activate the environment, you can also run the repo-local interpreter directly:
+
+```bash
+.venv/bin/python scripts/build_possessions.py --help
 ```
 
 ## Pipeline Entry Points
@@ -112,7 +117,7 @@ For example, `scripts/build_possessions.py` is just a command-line entrypoint fo
 Standard processed dataset:
 
 ```bash
-python scripts/build_possessions.py \
+.venv/bin/python scripts/build_possessions.py \
   --games-dir data/raw/tiny/games \
   --pbp data/raw/tiny/2015-16_pbp.csv \
   --output-dir data/processed/standard
@@ -121,7 +126,7 @@ python scripts/build_possessions.py \
 Rich tracking export:
 
 ```bash
-python scripts/build_rich_tracking.py \
+.venv/bin/python scripts/build_rich_tracking.py \
   --games-dir data/raw/tiny/games \
   --pbp data/raw/tiny/2015-16_pbp.csv \
   --output-dir data/processed/rich
@@ -130,7 +135,7 @@ python scripts/build_rich_tracking.py \
 Sequence model:
 
 ```bash
-python scripts/train_lstm.py --data data/processed/standard/frames.csv --label-column label_id
+.venv/bin/python scripts/train_lstm.py --data data/processed/standard/frames.csv --label-column label_id
 ```
 
 ## Recommended Execution Order
