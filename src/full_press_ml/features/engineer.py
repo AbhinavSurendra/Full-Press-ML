@@ -12,7 +12,8 @@ def add_basic_tracking_features(df: pd.DataFrame) -> pd.DataFrame:
             (feature_df["ball_x"] ** 2 + feature_df["ball_y"] ** 2) ** 0.5
         )
     if "shot_clock" in feature_df.columns:
-        feature_df["shot_clock_low"] = (feature_df["shot_clock"] <= 8).astype(int)
+        #Changed to 6 seconds for low shot clock
+        feature_df["shot_clock_low"] = (feature_df["shot_clock"] <= 6).astype(int)
     return feature_df
 
 
