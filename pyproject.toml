@@ -13,6 +13,7 @@ dependencies = [
   "pandas>=2.2",
   "py7zr>=0.22",
   "scikit-learn>=1.5",
+  "scipy>=1.11",
   "torch>=2.3",
   "xgboost>=2.1",
 ]

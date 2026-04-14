@@ -9,7 +9,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.preprocessing import LabelEncoder
 
-from full_press_ml.features.engineer import build_frame_aggregate_table
+from full_press_ml.features.engineer import build_frame_aggregate_table, build_rich_frame_aggregate_table
 from full_press_ml.models.baselines import build_logistic_regression, build_xgboost
 
 
@@ -21,11 +21,15 @@ def main() -> None:
     parser.add_argument("--eval-split", choices=["train", "val", "test"], default="test")
     parser.add_argument("--use-all-rows", action="store_true")
     parser.add_argument("--aggregate-frames", action="store_true")
+    parser.add_argument("--rich", action="store_true", help="Input is rich_frames.csv; use rich feature pipeline.")
     args = parser.parse_args()
 
     df = pd.read_csv(args.data)
     if args.aggregate_frames:
-        df = build_frame_aggregate_table(df)
+        if args.rich:
+            df = build_rich_frame_aggregate_table(df)
+        else:
+            df = build_frame_aggregate_table(df)
     if not args.use_all_rows and "is_usable" in df.columns:
         df = df[df["is_usable"] == 1].copy()
     if not args.use_all_rows and "possession_is_usable" in df.columns:
