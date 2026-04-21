@@ -48,6 +48,7 @@ def main() -> None:
     drop_columns = {
         "game_id",
         "possession_id",
+        "possession_number",
         "split",
         "event_ids",
         "end_reason",

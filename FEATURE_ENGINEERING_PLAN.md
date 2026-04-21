@@ -1,192 +1,204 @@
-# Feature Engineering Plan
+# Feature Engineering Plan — Phase C (External Context & Season Stats)
 
 ## Context
 
-The project predicts NBA possession outcomes (5 classes: `made_2`, `made_3`, `missed_shot`, `turnover`, `free_throws`) from SportVU player-tracking data. The core research question is **how early in a possession the outcome can be predicted** (at 2s, 4s, 6s, 8s horizons). The pipeline produces two frame-level data sources (see schema below) which feed tabular baselines (logistic regression, XGBoost) and the LSTM.
+Phases A and B are implemented and passing — 62.26% XGBoost accuracy on the medium 100-game slice after the April cleanup (drops + re-aggregations in [src/full_press_ml/features/engineer.py](src/full_press_ml/features/engineer.py)). The remaining feature-importance headroom is in **context that lives outside the tracking frames**: which team is on offense, how good they are, where the score stands, whether anyone on the court is tired or elite, and whether the team plays better at home. The weak class is `made_3` (f1 = 0.38) — a class that should respond specifically to team shooting profile and pace.
+
+This plan covers Phase C only. Phases A and B are documented in git history and in the pipeline overview.
 
 ---
 
-## Data Sources
+## Data audit — what we have vs. what we need
 
-### Standard frames (`data/processed/standard/frames.csv`) — 31 columns
-Pre-computed team aggregates, built by `build_possessions.py`.
+### Already present in the repo (just needs to be propagated)
 
-Key columns: `ball_x/y/z`, `shot_clock`, `game_clock`, `quarter`, `possession_frame_idx`, `offense_centroid_x/y`, `defense_centroid_x/y`, `offense_mean_radius`, `defense_mean_radius`, `offense_mean_distance_to_ball`, `defense_mean_distance_to_ball`, `split`, `possession_id`, `terminal_label`
+| Signal | Source in raw data | Currently in processed tables? |
+|---|---|---|
+| `game_date` | JSON `gamedate` per game | ❌ not propagated |
+| `home_team_id`, `away_team_id` | JSON `home.teamid` / `visitor.teamid`, or PBP | ❌ not propagated |
+| `score`, `score_margin` at any event | PBP `SCORE`, `SCOREMARGIN` | ❌ not merged |
+| `offense_team_id` (join key) | inferred from PBP | ✅ in frames.csv & possessions.csv |
+| Player IDs (for future player joins) | raw JSON moments / rich_frames player slots | ✅ in rich_frames.csv |
 
-### Rich frames (`data/processed/rich/rich_frames.csv`) — 68 columns ✓ generated
-Raw per-player slot coordinates, built by `build_rich_tracking.py`.
+### Newly uploaded — [data/external/](data/external/)
 
-Key columns: same ball/clock/game fields as above, plus `player_0_team_id/x/y/z` … `player_9_team_id/x/y/z`, `player_slot_count`
+All four files are **team-level, 2015-16 season, Basketball Reference format**.
 
-**Missing from rich_frames vs standard frames** (derived by `add_rich_player_features`):
-`offense_centroid_x/y`, `defense_centroid_x/y`, `offense_mean_radius`, `defense_mean_radius`, `offense_mean_distance_to_ball`, `defense_mean_distance_to_ball`, `player_count`, `offense_player_count`, `defense_player_count`, `missing_shot_clock`, `possession_frame_idx`
+| File | Columns we'll use | Notes |
+|---|---|---|
+| [advanced_stats.csv](data/external/advanced_stats.csv) | `ORtg`, `DRtg`, `NRtg`, `Pace`, `TS%`, `FTr`, `3PAr`, Off. Four Factors (`eFG%`, `TOV%`, `ORB%`, `FT/FGA`), Def. Four Factors (`eFG%`, `TOV%`, `DRB%`, `FT/FGA`) | Two-row header (group label + column name). Read with `header=[0,1]` or `skiprows=1`. |
+| [per_game_stats.csv](data/external/per_game_stats.csv) | `FG%`, `3P%`, `FT%`, `AST`, `TOV`, `TRB`, `PTS` | Single-row header. Most already covered by per-100 version — likely drop in favor of the per-100 file. |
+| [per_100_possessions.csv](data/external/per_100_possessions.csv) | Per-100 versions of per-game — pace-adjusted, better for offense/defense comparison | Single-row header. Preferred over per_game for pace-adjusted comparison. |
+| [shooting_stats.csv](data/external/shooting_stats.csv) | `%FGA` by distance (0-3, 3-10, 10-16, 16-3P, 3P), `FG%` by distance, `%FG assisted` (2P, 3P), corner 3 `%3PA` + `3P%` | Two-row header. Drives a team-specific shot-type prior for `made_3` class. |
 
-### Player frames (`data/processed/rich/player_frames.csv`) ✓ generated
-Long format — one row per player per frame. Available but not yet used in feature engineering.
+All four files have:
+- A "League Average" row at the bottom — filter on `Rk.notna()` or `Team != "League Average"`
+- Playoff teams marked with `*` suffix (e.g. `"Golden State Warriors*"`) — strip before matching
+- Team names as full strings, not IDs — needs mapping to numeric SportVU `team_id`
+
+### Missing — would unlock additional features if sourced later
+
+| Signal | Would enable feature | Alternative if not sourced |
+|---|---|---|
+| Player-level PER / BPM / usage% for 2015-16 | `star_player_on_court`, `offense_mean_usage_on_court`, `offense_mean_per_on_court` | Drop player-quality features from Phase C; rely on team-level stats only |
+| NBA 2015-16 game schedule | `rest_days`, `is_back_to_back` | Compute from `game_date` ordering across our own games; same team + gap → compute on the fly (works for the subset of games in our dataset) |
+
+---
+
+## Sub-phases (three independent tracks)
+
+### C-1 — Propagate already-available context (no external file work)
+
+Three features, all from files already in the repo.
+
+| Feature | Implementation |
+|---|---|
+| `game_date` | In [src/full_press_ml/data/raw_loader.py](src/full_press_ml/data/raw_loader.py) near line 137, add `"game_date": game.get("gamedate")` to the event row dict; carry it onto frames via the event→frame merge. Same addition in [src/full_press_ml/data/build_rich_tracking.py](src/full_press_ml/data/build_rich_tracking.py) |
+| `is_offense_home` | In the same raw_loader pass, pull `home.teamid` / `visitor.teamid` from the JSON. Emit per-event columns `home_team_id`, `away_team_id`. Compute `is_offense_home = int(offense_team_id == home_team_id)` — either in raw_loader or in a new enrichment step. |
+| `score_margin_at_start`, `offense_score_diff_at_start` | Merge from PBP on `(game_id, event_id)` using the **first event of each possession only** to avoid outcome leakage. Parse `SCOREMARGIN` format — `"+5"` / `"-3"` / `"TIE"` / numeric-as-string. `offense_score_diff = margin` if home team has ball else `-margin` (sign depends on which side PBP reports). Implement in [src/full_press_ml/data/possession_rules.py](src/full_press_ml/data/possession_rules.py) inside `segment_possessions()` or as a post-step. |
+
+**Leakage guard:** verify on a made-shot possession that the merged `score_margin_at_start` does NOT reflect the made basket. Easy check: find any `made_2` possession, compare `score_margin_at_start` against the PBP `SCORE` row at the *previous* event.
+
+**Aggregation into features:** these three are possession-level constants → merge onto the possession table. All three land as single columns (no mean/std/min/max).
+
+### C-2 — Derived from C-1 (still no external files)
+
+Requires C-1's `game_date` to be in the processed tables.
+
+| Feature | Formula |
+|---|---|
+| `rest_days` | For each possession, look up `offense_team_id`'s most recent game date *before* this one in the dataset. `rest_days = (this_game_date - prior_game_date).days`. First game for each team → fill with median. |
+| `is_back_to_back` | `(rest_days <= 1).astype(int)` |
+| `days_into_season` | `game_date - min(game_date in dataset)`, in days. Proxy for midseason fatigue / role clarity. |
+
+**Implementation:** new module `src/full_press_ml/data/enrich_context.py`, called by `build_possessions.py` after possession tables are built. Input: possessions dataframe with `game_id, game_date, offense_team_id`. Output: same frame with three extra columns.
+
+**Caveat:** `rest_days` computed from our dataset only — if a team's actual prior NBA game was outside our 100-game slice, we'll overestimate rest. Acceptable for a first pass; revisit if we source the full schedule.
+
+### C-3 — External CSV joins (team-level)
+
+New module: `src/full_press_ml/data/enrich_season_stats.py`. Called after aggregation in [src/full_press_ml/features/engineer.py](src/full_press_ml/features/engineer.py) — specifically at the end of `build_rich_frame_aggregate_table()` and `build_frame_aggregate_table()`, OR as a post-step inside [train_baseline.py](src/full_press_ml/training/train_baseline.py) before feature selection (simpler, same effect since aggregation is deterministic).
+
+#### Step 1 — Team ID mapping table
+
+New file: `data/external/team_id_map.csv` (30 rows, hand-built once).
+
+```
+team_id,br_team_name,br_abbr
+1610612737,Atlanta Hawks,ATL
+1610612738,Boston Celtics,BOS
+…
+```
+
+SportVU team IDs come from raw JSON; Basketball Reference team names come from the CSVs. One-time manual join; stable across seasons.
+
+#### Step 2 — Loader for each CSV
+
+```python
+# enrich_season_stats.py
+def load_advanced_stats(path):
+    df = pd.read_csv(path, skiprows=1)     # skip the group-label row
+    df = df[df["Rk"].notna()]               # drop "League Average"
+    df["Team"] = df["Team"].str.rstrip("*") # strip playoff marker
+    return df
+
+def load_per_100(path): ...
+def load_shooting(path): ...
+```
+
+Each loader returns a DataFrame keyed by `Team` (full name), ready to merge onto the ID map.
+
+#### Step 3 — Features from [advanced_stats.csv](data/external/advanced_stats.csv)
+
+All joined on `offense_team_id` (and mirrored on `defense_team_id` where it exists — defense team is the non-offense team in the matchup, and for our data this means the home/away team complement).
+
+Offense side (the team with the ball):
+- `offense_team_ortg` — offensive rating
+- `offense_team_pace`
+- `offense_team_ts_pct`
+- `offense_team_ftr`, `offense_team_3par`
+- `offense_team_efg_pct`, `offense_team_tov_pct`, `offense_team_orb_pct`, `offense_team_ft_per_fga`
+
+Defense side (the opponent's defense):
+- `defense_team_drtg`
+- `defense_team_opp_efg_pct`, `defense_team_opp_tov_pct`, `defense_team_drb_pct`, `defense_team_opp_ft_per_fga`
+- `matchup_net_rating_diff = offense_team_ortg - defense_team_drtg`
+
+#### Step 4 — Features from [per_100_possessions.csv](data/external/per_100_possessions.csv)
+
+Most overlap with advanced_stats. Pull the two that don't:
+- `offense_team_ast_per_100`
+- `offense_team_stl_per_100`, `defense_team_blk_per_100`
+
+Skip [per_game_stats.csv](data/external/per_game_stats.csv) — it's the same data pace-confounded. Keep it as a fallback reference but don't join it in.
+
+#### Step 5 — Features from [shooting_stats.csv](data/external/shooting_stats.csv)
+
+These are the most interesting for `made_3` class recovery.
+- `offense_team_pct_fga_3p` — how three-happy is the offense
+- `offense_team_fg_pct_3p` — how good are they at 3s
+- `offense_team_corner3_rate`, `offense_team_corner3_pct`
+- `offense_team_pct_fga_0_3` — rim rate
+- `offense_team_fg_pct_0_3` — finishing at rim
+- `offense_team_pct_fg_3p_assisted` — team playstyle (catch-and-shoot vs. pull-up)
+
+Mirror the distance breakdowns on defense for opponent allowed shots → `defense_team_pct_fga_3p_allowed` etc. Basketball Reference reports these under the same CSV for the defending team.
+
+### C-4 — Player-level features (DEFERRED)
+
+Would add: `star_player_on_court`, `offense_mean_per_on_court`, `offense_mean_usage_on_court`.
+
+Requires a player-level 2015-16 stats CSV (PER, BPM, usage%) from Basketball Reference's player season-totals page — NOT in the uploaded files. Flagged as the single highest-value missing data source.
+
+When sourced, join logic lives in the same `enrich_season_stats.py`:
+1. Load `player_stats.csv` keyed on BR player ID
+2. Build map from SportVU `player_id` (from rich_frames player slots) to BR ID — requires either a manual name-based map or downloading a mapping table
+3. For each possession, look up the 5 `is_offense` player slots in rich_frames at the possession's first frame, join their PER / usage%, and aggregate: `max(PER)`, `mean(usage%)`, `count(PER >= 20)`
 
 ---
 
 ## Critical Files
 
-| File | Role |
+| Path | Change |
 |---|---|
-| `src/full_press_ml/features/engineer.py` | All feature engineering — standard and rich pipelines |
-| `src/full_press_ml/training/train_baseline.py` | `--aggregate-frames` + `--rich` flags dispatch the right pipeline |
-| `src/full_press_ml/data/build_rich_tracking.py` | Generates `rich_frames.csv` and `player_frames.csv` |
-| `data/processed/standard/frames.csv` | Standard pipeline input |
-| `data/processed/rich/rich_frames.csv` | Rich pipeline input |
-| `data/raw/tiny/2015-16_pbp.csv` | Raw play-by-play |
-
----
-
-## Pipeline Architecture
-
-### Standard pipeline
-```
-frames.csv → build_frame_aggregate_table() → possession-level features
-```
-
-### Rich pipeline (new)
-```
-rich_frames.csv → add_rich_player_features()
-                     ├── derives standard columns from player slots (vectorized numpy)
-                     ├── adds Phase B per-frame features
-                     └── build_rich_frame_aggregate_table()
-                             ├── calls build_frame_aggregate_table() for all Phase A aggregations
-                             └── merges Phase B aggregations on top
-```
-
-### Training command
-```bash
-# Standard pipeline
-python -m full_press_ml.training.train_baseline \
-  --data data/processed/standard/frames.csv \
-  --aggregate-frames --model xgboost --eval-split val
-
-# Rich pipeline (Phase A + B features)
-python -m full_press_ml.training.train_baseline \
-  --data data/processed/rich/rich_frames.csv \
-  --aggregate-frames --rich --model xgboost --eval-split val
-```
-
----
-
-## Phase A — ✓ Implemented
-
-All features computed in `add_basic_tracking_features()` and `_add_motion_features()` in `engineer.py`. Work with both standard and rich frames (the shim provides the required columns for rich frames).
-
-### Spatial
-
-| Feature | Status | Output columns |
-|---|---|---|
-| `ball_dist_to_hoop` | ✓ done | `ball_dist_to_hoop_mean/std/min/max`, `ball_dist_to_hoop_start/end`, `ball_dist_to_hoop_delta` |
-| `ball_in_paint` | ✓ done | `ball_in_paint_fraction`, `ball_entered_paint` |
-| `ball_distance_from_center` | ✓ done | `ball_distance_from_center_mean/std/min/max` |
-| offense/defense spacing | ✓ done | `offense_mean_radius_mean/std/min/max/start/end/delta`, same for defense |
-
-### Movement / Motion
-
-| Feature | Status | Output columns |
-|---|---|---|
-| `ball_speed` | ✓ done | `ball_speed_mean/std/min/max` |
-| `ball_dist_traveled` | ✓ done | `ball_dist_traveled` |
-| `ball_toward_basket` | ✓ done | `ball_toward_basket_mean/std/min/max` |
-| `pass_count_proxy` | ✓ done | `pass_count_proxy` |
-
-### Context / Timing
-
-| Feature | Status | Output columns |
-|---|---|---|
-| `shot_clock_bucket` | ✓ done | `shot_clock_bucket_mean`, `shot_clock_bucket_start` |
-| `shot_clock_low` | ✓ done | `shot_clock_low_mean` |
-| `shot_clock_consumed` | ✓ done | `shot_clock_consumed` |
-| game clock start/end | ✓ done | `game_clock_start/end` |
-
----
-
-## Phase B — ✓ Implemented (rich pipeline only)
-
-Computed in `add_rich_player_features()` using numpy vectorization over the 10 player slot columns. Aggregated in `build_rich_frame_aggregate_table()`.
-
-### How `add_rich_player_features` works
-
-1. Sorts by `(game_id, possession_id, event_id, frame_idx)`, derives `possession_frame_idx` via `cumcount`
-2. Builds `(N, 10)` numpy arrays for `team_ids`, `xs`, `ys` from player slots
-3. Creates boolean `is_offense` / `is_defense` masks by comparing `player_i_team_id` against `offense_team_id` (NaN-safe)
-4. Computes all standard-frames columns (centroids, radii, distances) via masked `np.nanmean`
-5. Adds Phase B per-frame features (see below)
-
-### Phase B features
-
-| Feature | Per-frame logic | Aggregated output columns |
-|---|---|---|
-| `nearest_defender_to_ball` | `np.nanmin` of defense player distances to ball | `nearest_defender_to_ball_mean`, `nearest_defender_to_ball_min` |
-| `offense_convex_hull_area` | `scipy.spatial.ConvexHull(offense_x/y_pts).volume` per row | `offense_convex_hull_area_mean/std` |
-| `defense_convex_hull_area` | Same for defense | `defense_convex_hull_area_mean/std` |
-| `paint_occupancy_offense` | Count offense players with x/y in paint zone | `paint_occupancy_offense_mean/max` |
-| `paint_occupancy_defense` | Count defense players in paint | `paint_occupancy_defense_mean/max` |
-
-**Note on convex hull:** `_convex_hull_area(pts)` returns `NaN` for < 3 valid players or collinear points. These fill to `0.0` via `fillna` in the training script.
-
-### Phase B features not yet implemented
-
-| Feature | Reason deferred |
-|---|---|
-| Per-player speeds (`off_player_avg_speed`, `off_player_max_speed`) | Requires per-player tracking through possession; complex identity matching — use `player_frames.csv` long format |
-| `ball_handler_speed` / `ball_handler_acceleration` | Ball-handler identity flips frame-to-frame; needs smoothing — deferred |
-
----
-
-## Phase C — Needs External Data
-
-### Context features
-
-| Feature | What's needed | Notes |
-|---|---|---|
-| `score_margin` | Score at possession start | Check if `SCORE`/`SCOREMARGIN` in `2015-16_pbp.csv`. Use value at possession *start* only (leakage risk). |
-| `home_away_indicator` | Which team is home | From game schedule or game_id metadata |
-| `rest_days` / back-to-back | Game schedule | Basketball Reference 2015-16 schedule |
-| `star_player_on_court` | Player quality ratings | Join 2015-16 PER/VORP by `player_id` |
-
-### Team season stats (join on `offense_team_id`)
-
-| Feature | Source |
-|---|---|
-| `offense_true_shooting_pct` | Basketball Reference team stats 2015-16 |
-| `offense_turnover_rate` | Same |
-| `offense_net_rating`, `defense_net_rating` | Basketball Reference / NBA stats API |
-| `offense_reb_pct`, `offense_foul_rate`, `offense_ft_pct` | Same |
-
-**How to implement:** Download per-stat CSVs. Map SportVU numeric `team_id` to Basketball Reference team name. Static join at possession level.
+| [src/full_press_ml/data/raw_loader.py](src/full_press_ml/data/raw_loader.py) | Propagate `gamedate`, `home_team_id`, `away_team_id` (C-1) |
+| [src/full_press_ml/data/build_rich_tracking.py](src/full_press_ml/data/build_rich_tracking.py) | Same — rich pipeline has a parallel loader path |
+| [src/full_press_ml/data/possession_rules.py](src/full_press_ml/data/possession_rules.py) | Merge PBP `SCOREMARGIN` at possession start (C-1) |
+| `src/full_press_ml/data/enrich_context.py` (new) | Rest days, back-to-back, days into season (C-2) |
+| `src/full_press_ml/data/enrich_season_stats.py` (new) | Loaders + joins for the four external CSVs (C-3) |
+| `data/external/team_id_map.csv` (new) | 30-row mapping, SportVU numeric ↔ Basketball Reference name ↔ abbr |
+| [src/full_press_ml/features/engineer.py](src/full_press_ml/features/engineer.py) | Call `enrich_season_stats` at the end of `build_rich_frame_aggregate_table` and `build_frame_aggregate_table` |
 
 ---
 
 ## Verification
 
 ```bash
-# 1. Confirm Phase A still works on standard frames
+# Baseline (Phases A+B after April cleanup)
 python -m full_press_ml.training.train_baseline \
-  --data data/processed/standard/frames.csv \
-  --aggregate-frames --model xgboost --eval-split val
+  --data data/processed/rich_medium/rich_frames.csv \
+  --aggregate-frames --rich --model xgboost --eval-split test
 
-# 2. Run rich pipeline — compare accuracy against 53.5% standard baseline
-python -m full_press_ml.training.train_baseline \
-  --data data/processed/rich/rich_frames.csv \
-  --aggregate-frames --rich --model xgboost --eval-split val
+# After C-1 + C-2 (context from files we already have):
+# Expect small but consistent lift; watch is_offense_home, rest_days, score_margin land
+# in the importance table.
 
-# 3. Spot-check Phase B columns are present
-python -c "
-import pandas as pd
-from full_press_ml.features.engineer import build_rich_frame_aggregate_table
-df = pd.read_csv('data/processed/rich/rich_frames.csv')
-out = build_rich_frame_aggregate_table(df)
-phase_b = [c for c in out.columns if any(k in c for k in ['hull', 'paint', 'defender'])]
-print(phase_b)
-print(out[phase_b].describe())
-"
+# After C-3 (external CSVs joined):
+# Expect the biggest lift to be on made_3 f1. Team pace and 3PA rate should land
+# in the top half of the importance table.
 ```
 
-Expected outcomes:
-- Phase A standard: matches or exceeds existing 53.5% benchmark
-- Phase A + B rich: same or better than standard (Phase B adds new signal)
-- Phase B columns should have no all-NaN possessions for `nearest_defender_to_ball`; hull areas may have NaN for very short possessions (< 3 players tracked)
+Spot checks:
+- `score_margin_at_start` should NOT equal the post-possession margin (leakage sniff test)
+- Pick a known back-to-back game from the schedule and verify `rest_days == 1` for the right team
+- Every possession's `offense_team_ortg` should match the team's row in advanced_stats.csv
+- No NaNs introduced on the 30 teams in the dataset (unmapped team IDs would silently fill NaN)
+
+## Recommended ordering
+
+1. **C-1** — half day; uses only files we already have; confirms the plumbing
+2. **C-2** — hour or two; depends on C-1's game_date; minimal external risk
+3. **C-3** — half day; needs the team ID map (the manual one-time piece); largest expected accuracy gain
+4. **C-4** — deferred until player-level CSV is sourced
+
+After each stage, re-run medium and diff the feature importance table — the point isn't just overall accuracy, it's identifying *which* context signals land.

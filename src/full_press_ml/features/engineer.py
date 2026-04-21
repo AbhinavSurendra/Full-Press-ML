@@ -75,6 +75,14 @@ def add_basic_tracking_features(df: pd.DataFrame) -> pd.DataFrame:
             (feature_df["ball_x"] - hoop_x) ** 2 + (feature_df["ball_y"] - _HOOP_Y) ** 2
         ) ** 0.5
 
+    # Distance from midcourt: attacking direction flips at halftime, so the
+    # absolute offense_centroid_x value mixes two regimes. Distance from the
+    # half-court line isolates "how deep in the offensive half" regardless of end.
+    if "offense_centroid_x" in feature_df.columns:
+        feature_df["offense_centroid_x_normalized"] = (
+            feature_df["offense_centroid_x"] - _HALF_COURT_X
+        ).abs()
+
     # --- NEW: ball in paint (binary) -------------------------------------
     if {"ball_x", "ball_y"}.issubset(feature_df.columns):
         in_left_paint = (
@@ -297,13 +305,19 @@ def build_rich_frame_aggregate_table(rich_df: pd.DataFrame) -> pd.DataFrame:
     grouped = build_frame_aggregate_table(feature_df)
 
     # --- Phase B possession-level aggregations ---
+    # nearest_defender_to_ball: _min (closest a defender ever got) is the
+    # physically meaningful summary; start/end are added via the start/end block
+    # in build_frame_aggregate_table. Mean-of-min-over-defenders is dropped
+    # because it conflates shot-moment quality with off-ball defensive spacing.
     phase_b: dict[str, list[str]] = {}
-    for col in ["nearest_defender_to_ball"]:
-        if col in feature_df.columns:
-            phase_b[col] = ["mean", "min"]
-    for col in ["offense_convex_hull_area", "defense_convex_hull_area"]:
-        if col in feature_df.columns:
-            phase_b[col] = ["mean", "std"]
+    if "nearest_defender_to_ball" in feature_df.columns:
+        phase_b["nearest_defender_to_ball"] = ["min"]
+    if "offense_convex_hull_area" in feature_df.columns:
+        phase_b["offense_convex_hull_area"] = ["mean", "std"]
+    # defense_convex_hull_area: add _min (tightest defensive spacing seen in
+    # possession) — low importance in prior runs suggests mean washes out signal.
+    if "defense_convex_hull_area" in feature_df.columns:
+        phase_b["defense_convex_hull_area"] = ["mean", "std", "min"]
     for col in ["paint_occupancy_offense", "paint_occupancy_defense"]:
         if col in feature_df.columns:
             phase_b[col] = ["mean", "max"]
@@ -331,15 +345,17 @@ def build_frame_aggregate_table(frame_df: pd.DataFrame) -> pd.DataFrame:
     aggregations: dict[str, list[str]] = {}
 
     # --- existing aggregate columns --------------------------------------
+    # Dropped: game_clock (resets per quarter — mean/std/min/max are meaningless;
+    # start/end/delta below capture the usable signal). is_valid_frame (training
+    # already filters to usable possessions, so there's no variance left).
     for col in [
-        "game_clock",
         "shot_clock",
         "ball_x",
         "ball_y",
         "ball_z",
         "ball_distance_from_center",
         "offense_centroid_x",
-        "offense_centroid_y",
+        "offense_centroid_x_normalized",
         "offense_mean_radius",
         "offense_mean_distance_to_ball",
         "defense_centroid_x",
@@ -347,10 +363,14 @@ def build_frame_aggregate_table(frame_df: pd.DataFrame) -> pd.DataFrame:
         "defense_mean_radius",
         "defense_mean_distance_to_ball",
         "missing_shot_clock",
-        "is_valid_frame",
     ]:
         if col in feature_df.columns:
             aggregations[col] = ["mean", "std", "min", "max"]
+
+    # offense_centroid_y: within-possession std/min/max is noisy; keep only mean
+    # (wing vs corner vs middle is still a meaningful possession-level distinction).
+    if "offense_centroid_y" in feature_df.columns:
+        aggregations["offense_centroid_y"] = ["mean"]
 
     if "shot_clock_low" in feature_df.columns:
         aggregations["shot_clock_low"] = ["mean"]
@@ -364,20 +384,14 @@ def build_frame_aggregate_table(frame_df: pd.DataFrame) -> pd.DataFrame:
         aggregations["shot_clock_bucket"] = ["mean"]
 
     if "ball_in_paint" in feature_df.columns:
-        aggregations["ball_in_paint"] = ["mean", "max"]
+        aggregations["ball_in_paint"] = ["mean"]
 
     grouped = feature_df.groupby(base_group).agg(aggregations)
     grouped.columns = ["_".join(part for part in col if part).rstrip("_") for col in grouped.columns.to_flat_index()]
     grouped = grouped.reset_index()
 
-    # Rename ball_in_paint_mean → ball_in_paint_fraction, ball_in_paint_max → ball_entered_paint
-    rename_map: dict[str, str] = {}
     if "ball_in_paint_mean" in grouped.columns:
-        rename_map["ball_in_paint_mean"] = "ball_in_paint_fraction"
-    if "ball_in_paint_max" in grouped.columns:
-        rename_map["ball_in_paint_max"] = "ball_entered_paint"
-    if rename_map:
-        grouped = grouped.rename(columns=rename_map)
+        grouped = grouped.rename(columns={"ball_in_paint_mean": "ball_in_paint_fraction"})
 
     # --- start / end features (first and last frame of each possession) --
     first_last_features = []
@@ -400,6 +414,9 @@ def build_frame_aggregate_table(frame_df: pd.DataFrame) -> pd.DataFrame:
                 "defense_mean_radius",
                 "defense_mean_distance_to_ball",
                 "ball_dist_to_hoop",
+                "offense_convex_hull_area",
+                "defense_convex_hull_area",
+                "nearest_defender_to_ball",
             ]
             if col in frame_slice.columns
         ]
@@ -444,19 +461,12 @@ def build_frame_aggregate_table(frame_df: pd.DataFrame) -> pd.DataFrame:
     if "shot_clock_start" in grouped.columns and "shot_clock_end" in grouped.columns:
         grouped["shot_clock_consumed"] = grouped["shot_clock_start"] - grouped["shot_clock_end"]
 
-    # --- NEW: shot_clock_bucket at possession start ----------------------
-    if "shot_clock_bucket" in feature_df.columns:
-        bucket_start = (
-            feature_df.groupby(base_group, as_index=False)
-            .head(1)[base_group + ["shot_clock_bucket"]]
-            .rename(columns={"shot_clock_bucket": "shot_clock_bucket_start"})
-        )
-        grouped = grouped.merge(bucket_start, on=base_group, how="left")
-
     # --- metadata columns ------------------------------------------------
+    # quarter is passed through so the model can condition on game phase
+    # (game_clock resets per quarter, so quarter itself is the meaningful signal).
     meta_columns = [
         col
-        for col in ["possession_number", "terminal_label", "split", "possession_is_usable"]
+        for col in ["possession_number", "terminal_label", "split", "possession_is_usable", "quarter"]
         if col in feature_df.columns
     ]
     if meta_columns:
