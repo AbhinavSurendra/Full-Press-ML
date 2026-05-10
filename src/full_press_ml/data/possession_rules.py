@@ -28,6 +28,46 @@ def parse_period_clock(clock_text: object) -> float | None:
         return None
 
 
+def parse_score_margin(value: object) -> float | None:
+    """Parse a play-by-play SCOREMARGIN cell into a numeric (home perspective).
+
+    SCOREMARGIN comes through as '+5' / '-3' / 'TIE' / '5' / NaN. Returns None
+    if the cell is missing or not parseable, 0.0 for 'TIE', else float(value).
+    """
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return None
+    if text.upper() == "TIE":
+        return 0.0
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_team_id(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_game_date(value: object) -> object:
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    return value
+
+
 def infer_offense_team_id(row: pd.Series) -> float | None:
     """Infer which team has possession during the event."""
 
@@ -105,6 +145,13 @@ class PossessionAccumulator:
     valid_frame_count: int = 0
     invalid_frame_count: int = 0
     missing_shot_clock_count: int = 0
+    # C-1 context captured from the FIRST event of the possession only — using
+    # the start-of-possession SCOREMARGIN ensures the value reflects state before
+    # any shot in this possession (no outcome leakage).
+    score_margin_raw: object = None
+    home_team_id: float | None = None
+    away_team_id: float | None = None
+    game_date: object = None
 
 
 def _finalize_possession(
@@ -131,6 +178,17 @@ def _finalize_possession(
         and invalid_ratio <= 0.20
     )
 
+    score_margin_at_start = parse_score_margin(current.score_margin_raw)
+    is_offense_home: int | None = None
+    offense_score_diff_at_start: float | None = None
+    if current.offense_team_id is not None and current.home_team_id is not None:
+        is_offense_home = int(int(current.offense_team_id) == int(current.home_team_id))
+        if score_margin_at_start is not None:
+            # SCOREMARGIN is from home's perspective (positive = home leads).
+            offense_score_diff_at_start = (
+                score_margin_at_start if is_offense_home else -score_margin_at_start
+            )
+
     return {
         "game_id": current.game_id,
         "possession_id": f"{current.game_id}_{current.possession_number:04d}",
@@ -152,6 +210,13 @@ def _finalize_possession(
         "missing_shot_clock_ratio": missing_shot_clock_ratio,
         "end_reason": reason,
         "is_usable": int(is_usable),
+        # C-1 context (None on legacy event tables that don't carry these fields)
+        "home_team_id": current.home_team_id,
+        "away_team_id": current.away_team_id,
+        "game_date": current.game_date,
+        "score_margin_at_start": score_margin_at_start,
+        "is_offense_home": is_offense_home,
+        "offense_score_diff_at_start": offense_score_diff_at_start,
     }
 
 
@@ -225,6 +290,10 @@ def segment_possessions(events: pd.DataFrame) -> pd.DataFrame:
                     offense_team_id=offense_team_id,
                     split=split,
                     event_ids=[],
+                    score_margin_raw=row.get("score_margin_raw") if hasattr(row, "get") else None,
+                    home_team_id=_coerce_team_id(row.get("home_team_id")) if hasattr(row, "get") else None,
+                    away_team_id=_coerce_team_id(row.get("away_team_id")) if hasattr(row, "get") else None,
+                    game_date=_coerce_game_date(row.get("game_date")) if hasattr(row, "get") else None,
                 )
 
             current.event_ids.append(event_id)

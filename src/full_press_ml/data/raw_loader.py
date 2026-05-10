@@ -162,6 +162,11 @@ def load_normalized_tracking_data(
     """Normalize raw game JSON files into event-level and frame-level tables."""
 
     pbp = pd.read_csv(pbp_path)
+    # Forward-fill SCOREMARGIN within each game so non-score events carry the
+    # latest known margin (PBP only updates SCOREMARGIN on score events).
+    if "SCOREMARGIN" in pbp.columns:
+        pbp = pbp.sort_values(["GAME_ID", "EVENTNUM"]).reset_index(drop=True)
+        pbp["SCOREMARGIN"] = pbp.groupby("GAME_ID")["SCOREMARGIN"].ffill()
     json_paths = sorted(games_dir.glob("*/*.json"))
     game_ids = []
     for json_path in json_paths:
@@ -179,6 +184,10 @@ def load_normalized_tracking_data(
 
         game_id = int(game["gameid"])
         split = split_map[game_id]
+        # C-1 plumbing: pull game-header context once per game.
+        home_team_id = _safe_float((game.get("home") or {}).get("teamid"))
+        away_team_id = _safe_float((game.get("visitor") or {}).get("teamid"))
+        game_date = game.get("gamedate")
         pbp_game = pbp[pbp["GAME_ID"] == game_id]
         pbp_lookup = {
             int(row["EVENTNUM"]): row
@@ -209,6 +218,10 @@ def load_normalized_tracking_data(
                         "has_tracking": int(bool(moments)),
                         "pbp_join_status": "missing",
                         "split": split,
+                        "home_team_id": home_team_id,
+                        "away_team_id": away_team_id,
+                        "game_date": game_date,
+                        "score_margin_raw": None,
                     }
                 )
                 continue
@@ -238,6 +251,9 @@ def load_normalized_tracking_data(
                         "frame_idx": frame_idx,
                         "split": split,
                         "offense_team_id": offense_team_id,
+                        "home_team_id": home_team_id,
+                        "away_team_id": away_team_id,
+                        "game_date": game_date,
                         "pbp_join_status": "matched",
                         "is_valid_frame": int(is_valid),
                         "missing_shot_clock": int(frame_features["shot_clock"] is None),
@@ -263,6 +279,10 @@ def load_normalized_tracking_data(
                     "has_tracking": int(bool(moments)),
                     "pbp_join_status": "matched",
                     "split": split,
+                    "home_team_id": home_team_id,
+                    "away_team_id": away_team_id,
+                    "game_date": game_date,
+                    "score_margin_raw": event_row.get("SCOREMARGIN") if hasattr(event_row, "get") else None,
                 }
             )
 

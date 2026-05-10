@@ -25,6 +25,23 @@ _PAINT_Y_HIGH = 33.0
 # 5 ft/frame = 125 ft/s — physically impossible via dribbling; consistent with pass or shot.
 _PASS_STEP_THRESHOLD = 5.0
 
+# NBA 3-point line geometry (feet)
+_THREE_POINT_RADIUS = 23.75       # arc radius beyond corners
+_THREE_POINT_CORNER_X = 22.0      # corner-3 distance from baseline hoop
+_CORNER_Y_LOW = 14.0              # |y - hoop_y| > 11 → corner zone
+_CORNER_Y_HIGH = 36.0
+_RIM_HEIGHT = 10.0                # ft
+
+# Shot release detection thresholds
+_RELEASE_MIN_BALL_Z = 7.0         # ft — must rise above this to count as a shot
+_RELEASE_APEX_MIN_Z = 10.0        # ft — apex must clear rim to qualify
+_RELEASE_APEX_MIN_RANGE = 4.0     # ft — ball_z range across possession (filters non-shots)
+_FT_LINE_X_LEFT = 19.0            # FT line x for left-hoop attacks
+_FT_LINE_X_RIGHT = 75.0           # FT line x for right-hoop attacks
+_FT_STATIONARY_FRAMES = 25        # frames of pre-apex stillness signaling a free throw
+_FT_X_TOLERANCE = 2.0             # ft — how close to FT line to count as stationary there
+_FT_X_STD_THRESHOLD = 1.0         # ft — ball_x std must stay under this
+
 
 def _convex_hull_area(pts: np.ndarray) -> float:
     """Convex hull area (ft²) for a (K, 2) array; NaN if < 3 valid points or collinear."""
@@ -112,6 +129,8 @@ def _add_motion_features(df: pd.DataFrame) -> pd.DataFrame:
     Adds:
       ball_step_dist  — Euclidean ball displacement (ft) from previous frame
       ball_speed      — ball_step_dist * FRAME_RATE (ft/s)
+      ball_step_dist_z — signed z-axis displacement (ft) from previous frame
+      ball_speed_z    — ball_step_dist_z * FRAME_RATE (ft/s, signed)
       ball_toward_basket — dot product of ball step direction with unit vector
                           toward the attacking basket (positive = toward hoop)
     """
@@ -129,6 +148,11 @@ def _add_motion_features(df: pd.DataFrame) -> pd.DataFrame:
     feature_df["ball_step_dist"] = (dx**2 + dy**2) ** 0.5
     feature_df["ball_speed"] = feature_df["ball_step_dist"] * _FRAME_RATE
 
+    if "ball_z" in feature_df.columns:
+        dz = feature_df.groupby(valid_groups)["ball_z"].diff()
+        feature_df["ball_step_dist_z"] = dz
+        feature_df["ball_speed_z"] = dz * _FRAME_RATE
+
     # Direction toward basket: dot product of (dx, dy) with hoop unit vector
     if "offense_centroid_x" in feature_df.columns:
         attacking_right = (feature_df["offense_centroid_x"] < _HALF_COURT_X).astype(float)
@@ -144,6 +168,155 @@ def _add_motion_features(df: pd.DataFrame) -> pd.DataFrame:
         feature_df["ball_toward_basket"] = (dx * unit_x + dy * unit_y) / step_dist
 
     return feature_df
+
+
+_RELEASE_FEATURE_COLUMNS = [
+    "release_frame_idx",
+    "release_x",
+    "release_y",
+    "release_z",
+    "release_dist_to_hoop",
+    "is_behind_three_point_arc",
+    "is_corner_three",
+    "release_z_above_rim",
+    "release_ball_speed_xy",
+    "frames_after_release",
+    "nearest_defender_at_release",
+]
+
+
+def _detect_shot_release(feature_df: pd.DataFrame) -> pd.DataFrame:
+    """Detect the shot-release frame per possession and derive release features.
+
+    Algorithm (per (game_id, possession_id) group, sorted by possession_frame_idx):
+      1. Reject possessions whose ball_z range < _RELEASE_APEX_MIN_RANGE OR whose
+         apex height < _RELEASE_APEX_MIN_Z — no clear shot arc.
+      2. Apex frame = argmax(ball_z). Walk back through earlier frames; the release
+         frame is the first one immediately above _RELEASE_MIN_BALL_Z on the rising
+         edge to apex.
+      3. Free-throw structural mask (no terminal_label peek): all shot_clock null,
+         OR ball_x stationary at the FT line for _FT_STATIONARY_FRAMES before apex.
+         Both → no field-goal release; all features NaN.
+
+    Detector consumes only ball x/y/z and possession_frame_idx (plus shot_clock
+    and offense_centroid_x for context), never terminal_label, so it cannot leak
+    the prediction target.
+    """
+    base_group = ["game_id", "possession_id"]
+    required = {"ball_x", "ball_y", "ball_z", "possession_frame_idx"}
+    if not required.issubset(feature_df.columns):
+        return pd.DataFrame(columns=base_group + _RELEASE_FEATURE_COLUMNS)
+
+    has_centroid = "offense_centroid_x" in feature_df.columns
+    has_speed = "ball_speed" in feature_df.columns
+    has_defender = "nearest_defender_to_ball" in feature_df.columns
+
+    rows: list[dict[str, object]] = []
+    for keys, group in feature_df.groupby(base_group, sort=False):
+        game_id, possession_id = keys
+        sorted_group = group.sort_values("possession_frame_idx")
+        ball_z = sorted_group["ball_z"].to_numpy(dtype=float)
+        ball_x = sorted_group["ball_x"].to_numpy(dtype=float)
+        ball_y = sorted_group["ball_y"].to_numpy(dtype=float)
+        frame_idx_arr = sorted_group["possession_frame_idx"].to_numpy(dtype=float)
+
+        rec: dict[str, object] = {
+            "game_id": game_id,
+            "possession_id": possession_id,
+            **{col: np.nan for col in _RELEASE_FEATURE_COLUMNS},
+        }
+
+        if len(ball_z) == 0 or np.all(np.isnan(ball_z)):
+            rows.append(rec)
+            continue
+
+        z_max = float(np.nanmax(ball_z))
+        z_min = float(np.nanmin(ball_z))
+        if (z_max - z_min) < _RELEASE_APEX_MIN_RANGE or z_max < _RELEASE_APEX_MIN_Z:
+            rows.append(rec)
+            continue
+
+        if "shot_clock" in sorted_group.columns and sorted_group["shot_clock"].isna().all():
+            rows.append(rec)
+            continue
+
+        apex_idx = int(np.nanargmax(ball_z))
+
+        if apex_idx >= _FT_STATIONARY_FRAMES:
+            window = ball_x[apex_idx - _FT_STATIONARY_FRAMES : apex_idx]
+            window_valid = window[~np.isnan(window)]
+            if len(window_valid) >= int(0.8 * _FT_STATIONARY_FRAMES):
+                x_std = float(np.std(window_valid))
+                x_mean = float(np.mean(window_valid))
+                near_left_ft = abs(x_mean - _FT_LINE_X_LEFT) <= _FT_X_TOLERANCE
+                near_right_ft = abs(x_mean - _FT_LINE_X_RIGHT) <= _FT_X_TOLERANCE
+                if x_std < _FT_X_STD_THRESHOLD and (near_left_ft or near_right_ft):
+                    rows.append(rec)
+                    continue
+
+        release_idx = apex_idx
+        for r in range(apex_idx - 1, -1, -1):
+            zr = ball_z[r]
+            if np.isnan(zr):
+                continue
+            if zr <= _RELEASE_MIN_BALL_Z:
+                release_idx = r + 1
+                break
+            release_idx = r
+
+        x_at = ball_x[release_idx]
+        y_at = ball_y[release_idx]
+        z_at = ball_z[release_idx]
+        if np.isnan(x_at) or np.isnan(y_at) or np.isnan(z_at):
+            rows.append(rec)
+            continue
+
+        if has_centroid:
+            first_off_cx = sorted_group["offense_centroid_x"].iloc[0]
+            if pd.isna(first_off_cx):
+                first_off_cx = float(x_at)
+            attacking_right = float(first_off_cx) < _HALF_COURT_X
+        else:
+            attacking_right = float(x_at) < _HALF_COURT_X
+        hoop_x = _HOOP_RIGHT_X if attacking_right else _HOOP_LEFT_X
+
+        dx_h = x_at - hoop_x
+        dy_h = y_at - _HOOP_Y
+        dist = float(np.sqrt(dx_h * dx_h + dy_h * dy_h))
+
+        in_corner_zone = abs(y_at - _HOOP_Y) > 11.0
+        if in_corner_zone:
+            behind_arc = abs(dx_h) >= _THREE_POINT_CORNER_X
+        else:
+            behind_arc = dist >= _THREE_POINT_RADIUS
+
+        rec.update(
+            {
+                "release_frame_idx": float(frame_idx_arr[release_idx]),
+                "release_x": float(x_at),
+                "release_y": float(y_at),
+                "release_z": float(z_at),
+                "release_dist_to_hoop": dist,
+                "is_behind_three_point_arc": int(bool(behind_arc)),
+                "is_corner_three": int(bool(in_corner_zone and behind_arc)),
+                "release_z_above_rim": float(z_at - _RIM_HEIGHT),
+                "frames_after_release": float(frame_idx_arr[-1] - frame_idx_arr[release_idx]),
+            }
+        )
+
+        if has_speed:
+            speed_at = sorted_group["ball_speed"].iloc[release_idx]
+            if pd.notna(speed_at):
+                rec["release_ball_speed_xy"] = float(speed_at)
+
+        if has_defender:
+            ndb = sorted_group["nearest_defender_to_ball"].iloc[release_idx]
+            if pd.notna(ndb):
+                rec["nearest_defender_at_release"] = float(ndb)
+
+        rows.append(rec)
+
+    return pd.DataFrame(rows, columns=base_group + _RELEASE_FEATURE_COLUMNS)
 
 
 def add_rich_player_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -443,12 +616,34 @@ def build_frame_aggregate_table(frame_df: pd.DataFrame) -> pd.DataFrame:
         if start_col in grouped.columns and end_col in grouped.columns:
             grouped[f"{source}_delta"] = grouped[end_col] - grouped[start_col]
 
-    # --- NEW: possession-level aggregations requiring sum / custom logic --
+    # --- C-2: shot-release detection -------------------------------------
+    # Runs on the per-frame feature_df after motion features are added; produces
+    # one row per (game_id, possession_id) with release coordinates plus eight
+    # derived features. Detector ignores terminal_label, so it cannot leak.
+    release_df = _detect_shot_release(feature_df)
 
-    # ball_dist_traveled: total distance the ball moved over the possession
+    # --- NEW: possession-level aggregations requiring sum / custom logic --
+    # ball_dist_traveled / pass_count_proxy aggregate ball motion. Without the
+    # C-2 release truncation these counted post-shot rebound + outlet motion,
+    # which inflated pass_count_proxy as the runaway top feature. When a release
+    # is detected we restrict the aggregation to frames at or before the release
+    # frame; possessions with NaN release (FTs, dribble-only turnovers) keep
+    # whole-possession behaviour.
     if "ball_step_dist" in feature_df.columns:
+        if not release_df.empty and "release_frame_idx" in release_df.columns:
+            motion_source = feature_df.merge(
+                release_df[["game_id", "possession_id", "release_frame_idx"]],
+                on=base_group,
+                how="left",
+            )
+            keep_mask = motion_source["release_frame_idx"].isna() | (
+                motion_source["possession_frame_idx"] <= motion_source["release_frame_idx"]
+            )
+            motion_source = motion_source[keep_mask]
+        else:
+            motion_source = feature_df
         motion_agg = (
-            feature_df.groupby(base_group)
+            motion_source.groupby(base_group)
             .agg(
                 ball_dist_traveled=("ball_step_dist", "sum"),
                 pass_count_proxy=("ball_step_dist", lambda x: int((x > _PASS_STEP_THRESHOLD).sum())),
@@ -457,6 +652,9 @@ def build_frame_aggregate_table(frame_df: pd.DataFrame) -> pd.DataFrame:
         )
         grouped = grouped.merge(motion_agg, on=base_group, how="left")
 
+    if not release_df.empty:
+        grouped = grouped.merge(release_df, on=base_group, how="left")
+
     # --- NEW: shot_clock_consumed (positive = clock was used) ------------
     if "shot_clock_start" in grouped.columns and "shot_clock_end" in grouped.columns:
         grouped["shot_clock_consumed"] = grouped["shot_clock_start"] - grouped["shot_clock_end"]
@@ -464,9 +662,22 @@ def build_frame_aggregate_table(frame_df: pd.DataFrame) -> pd.DataFrame:
     # --- metadata columns ------------------------------------------------
     # quarter is passed through so the model can condition on game phase
     # (game_clock resets per quarter, so quarter itself is the meaningful signal).
+    # C-1 context fields (is_offense_home, score_margin_at_start,
+    # offense_score_diff_at_start) ride along on every frame after possession
+    # join — picking the last observation per group is fine because they're
+    # constant within a possession.
     meta_columns = [
         col
-        for col in ["possession_number", "terminal_label", "split", "possession_is_usable", "quarter"]
+        for col in [
+            "possession_number",
+            "terminal_label",
+            "split",
+            "possession_is_usable",
+            "quarter",
+            "is_offense_home",
+            "score_margin_at_start",
+            "offense_score_diff_at_start",
+        ]
         if col in feature_df.columns
     ]
     if meta_columns:

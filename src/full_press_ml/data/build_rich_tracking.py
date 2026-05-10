@@ -33,6 +33,7 @@ _PBP_LOOKUP_COLUMNS = [
     "VISITORDESCRIPTION",
     "PLAYER1_TEAM_ID",
     "PLAYER2_TEAM_ID",
+    "SCOREMARGIN",
 ]
 
 
@@ -93,7 +94,12 @@ def _build_pbp_lookup_by_game(pbp: pd.DataFrame) -> dict[int, dict[int, dict[str
     of iterrows. Downstream helpers only need __getitem__ / get on these rows.
     """
     available = [c for c in _PBP_LOOKUP_COLUMNS if c in pbp.columns]
-    subset = pbp[available].dropna(subset=["GAME_ID", "EVENTNUM"])
+    subset = pbp[available].dropna(subset=["GAME_ID", "EVENTNUM"]).copy()
+    # Forward-fill SCOREMARGIN within each game so non-score events carry the
+    # latest known margin (PBP only updates SCOREMARGIN on score events).
+    if "SCOREMARGIN" in subset.columns:
+        subset = subset.sort_values(["GAME_ID", "EVENTNUM"]).reset_index(drop=True)
+        subset["SCOREMARGIN"] = subset.groupby("GAME_ID")["SCOREMARGIN"].ffill()
     lookups: dict[int, dict[int, dict[str, object]]] = {}
     for record in subset.to_dict(orient="records"):
         game_key = int(record["GAME_ID"])
@@ -113,6 +119,10 @@ def _build_rows_for_game(
     rich_frame_rows: list[dict[str, object]] = []
     player_frame_rows: list[dict[str, object]] = []
     game_id = int(game["gameid"])
+    # C-1 plumbing: pull game-header context once per game.
+    home_team_id = _safe_float((game.get("home") or {}).get("teamid"))
+    away_team_id = _safe_float((game.get("visitor") or {}).get("teamid"))
+    game_date = game.get("gamedate")
 
     for event in game["events"]:
         event_id = int(event["eventId"])
@@ -142,6 +152,10 @@ def _build_rows_for_game(
                     "has_tracking": int(bool(moments)),
                     "pbp_join_status": "missing",
                     "split": split,
+                    "home_team_id": home_team_id,
+                    "away_team_id": away_team_id,
+                    "game_date": game_date,
+                    "score_margin_raw": None,
                 }
             )
 
@@ -173,6 +187,9 @@ def _build_rows_for_game(
                 "frame_idx": frame_idx,
                 "split": split,
                 "offense_team_id": offense_team_id,
+                "home_team_id": home_team_id,
+                "away_team_id": away_team_id,
+                "game_date": game_date,
                 "quarter": int(moment[0]),
                 "game_clock": _safe_float(moment[2]),
                 "shot_clock": shot_clock,
@@ -246,6 +263,10 @@ def _build_rows_for_game(
                     "has_tracking": int(bool(moments)),
                     "pbp_join_status": "matched",
                     "split": split,
+                    "home_team_id": home_team_id,
+                    "away_team_id": away_team_id,
+                    "game_date": game_date,
+                    "score_margin_raw": pbp_row.get("SCOREMARGIN"),
                 }
             )
 
@@ -261,17 +282,25 @@ def attach_possessions_by_event(
     if table.empty or possessions.empty:
         return table.copy()
 
-    mapping = possessions[
-        [
-            "game_id",
-            "event_ids",
-            "possession_id",
-            "possession_number",
-            "terminal_label",
-            "terminal_event_id",
-            "is_usable",
+    base_cols = [
+        "game_id",
+        "event_ids",
+        "possession_id",
+        "possession_number",
+        "terminal_label",
+        "terminal_event_id",
+        "is_usable",
+    ]
+    optional_cols = [
+        col
+        for col in [
+            "score_margin_at_start",
+            "offense_score_diff_at_start",
+            "is_offense_home",
         ]
-    ].copy()
+        if col in possessions.columns
+    ]
+    mapping = possessions[base_cols + optional_cols].copy()
     mapping["event_id"] = mapping["event_ids"].astype(str).str.split(",")
     mapping = mapping.explode("event_id")
     mapping = mapping[mapping["event_id"].astype(str).str.len() > 0].copy()
@@ -286,27 +315,32 @@ def attach_possessions_by_event(
 
 def _stream_attach_and_write(
     tmp_dir: Path,
-    output_path: Path,
+    output_dir: Path,
     possessions: pd.DataFrame,
     sort_cols: list[str],
 ) -> None:
-    """Second pass: read each per-game temp CSV, attach possessions, append to final CSV."""
-    if output_path.exists():
-        output_path.unlink()
+    """Second pass: read each per-game temp parquet, attach possessions, write
+    one parquet file per game into *output_dir*. The directory itself is the
+    parquet dataset — pandas / pyarrow read it as a single combined frame,
+    and downstream parallel aggregation can read each game independently.
+    """
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True)
 
-    first_write = True
-    for tmp_csv in sorted(tmp_dir.glob("*.csv")):
-        game_df = pd.read_csv(tmp_csv)
+    for tmp_pq in sorted(tmp_dir.glob("*.parquet")):
+        game_df = pd.read_parquet(tmp_pq)
         merged = attach_possessions_by_event(game_df, possessions)
-        if not merged.empty:
-            merged = merged.sort_values(sort_cols).reset_index(drop=True)
-        merged.to_csv(
-            output_path,
-            mode="w" if first_write else "a",
-            header=first_write,
+        if merged.empty:
+            continue
+        merged = merged.sort_values(sort_cols).reset_index(drop=True)
+        game_id = int(merged["game_id"].iloc[0])
+        merged.to_parquet(
+            output_dir / f"{game_id}.parquet",
+            engine="pyarrow",
+            compression="snappy",
             index=False,
         )
-        first_write = False
 
 
 def build_rich_processed_datasets(
@@ -370,15 +404,21 @@ def build_rich_processed_datasets(
         total_rich_rows += len(game_rich_rows)
 
         if game_rich_rows:
-            pd.DataFrame(game_rich_rows).to_csv(
-                tmp_rich_dir / f"{game_id}.csv", index=False
+            pd.DataFrame(game_rich_rows).to_parquet(
+                tmp_rich_dir / f"{game_id}.parquet",
+                engine="pyarrow",
+                compression="snappy",
+                index=False,
             )
 
         if write_player_frames and tmp_player_dir is not None:
             total_player_rows += len(game_player_rows)
             if game_player_rows:
-                pd.DataFrame(game_player_rows).to_csv(
-                    tmp_player_dir / f"{game_id}.csv", index=False
+                pd.DataFrame(game_player_rows).to_parquet(
+                    tmp_player_dir / f"{game_id}.parquet",
+                    engine="pyarrow",
+                    compression="snappy",
+                    index=False,
                 )
 
         del game, game_rich_rows, game_player_rows
@@ -392,7 +432,7 @@ def build_rich_processed_datasets(
 
     _stream_attach_and_write(
         tmp_dir=tmp_rich_dir,
-        output_path=output_dir / "rich_frames.csv",
+        output_dir=output_dir / "rich_frames",
         possessions=possessions,
         sort_cols=["game_id", "event_id", "frame_idx"],
     )
@@ -401,7 +441,7 @@ def build_rich_processed_datasets(
     if write_player_frames and tmp_player_dir is not None:
         _stream_attach_and_write(
             tmp_dir=tmp_player_dir,
-            output_path=output_dir / "player_frames.csv",
+            output_dir=output_dir / "player_frames",
             possessions=possessions,
             sort_cols=["game_id", "event_id", "frame_idx", "slot_idx"],
         )
@@ -435,7 +475,7 @@ def main() -> None:
     parser.add_argument(
         "--write-player-frames",
         action="store_true",
-        help="Also write player_frames.csv (long-form per-player rows).",
+        help="Also write player_frames/ directory (long-form per-player rows).",
     )
     args = parser.parse_args()
 
@@ -446,8 +486,8 @@ def main() -> None:
         write_player_frames=args.write_player_frames,
     )
 
-    events.to_csv(args.output_dir / "events.csv", index=False)
-    possessions.to_csv(args.output_dir / "possessions.csv", index=False)
+    events.to_parquet(args.output_dir / "events.parquet", engine="pyarrow", index=False)
+    possessions.to_parquet(args.output_dir / "possessions.parquet", engine="pyarrow", index=False)
     with (args.output_dir / "audit_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
 

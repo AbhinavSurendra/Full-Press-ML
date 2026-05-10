@@ -65,7 +65,10 @@ def main() -> None:
     parser.add_argument("--eval-split", choices=["train", "val", "test"], default="test")
     args = parser.parse_args()
 
-    frame_table = pd.read_csv(args.data)
+    if args.data.is_dir() or str(args.data).endswith(".parquet"):
+        frame_table = pd.read_parquet(args.data)
+    else:
+        frame_table = pd.read_csv(args.data)
     if "possession_is_usable" in frame_table.columns:
         frame_table = frame_table[frame_table["possession_is_usable"] == 1].copy()
     frame_table = frame_table[frame_table["possession_id"].notna()].copy()

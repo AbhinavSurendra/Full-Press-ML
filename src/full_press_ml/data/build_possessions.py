@@ -22,22 +22,29 @@ def attach_possessions_to_frames(
         return frames.copy()
 
     event_map_rows = []
+    optional_cols = [
+        "score_margin_at_start",
+        "offense_score_diff_at_start",
+        "is_offense_home",
+    ]
     for _, possession in possessions.iterrows():
         event_ids = str(possession["event_ids"]).split(",")
         for event_id in event_ids:
             if not event_id:
                 continue
-            event_map_rows.append(
-                {
-                    "game_id": int(possession["game_id"]),
-                    "event_id": int(event_id),
-                    "possession_id": possession["possession_id"],
-                    "possession_number": int(possession["possession_number"]),
-                    "terminal_label": possession["terminal_label"],
-                    "terminal_event_id": possession["terminal_event_id"],
-                    "possession_is_usable": int(possession["is_usable"]),
-                }
-            )
+            row: dict[str, object] = {
+                "game_id": int(possession["game_id"]),
+                "event_id": int(event_id),
+                "possession_id": possession["possession_id"],
+                "possession_number": int(possession["possession_number"]),
+                "terminal_label": possession["terminal_label"],
+                "terminal_event_id": possession["terminal_event_id"],
+                "possession_is_usable": int(possession["is_usable"]),
+            }
+            for col in optional_cols:
+                if col in possession.index:
+                    row[col] = possession[col]
+            event_map_rows.append(row)
 
     event_map = pd.DataFrame(event_map_rows)
     merged = frames.merge(event_map, on=["game_id", "event_id"], how="left")
@@ -95,9 +102,9 @@ def main() -> None:
         pbp_path=args.pbp,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    events.to_csv(args.output_dir / "events.csv", index=False)
-    frames.to_csv(args.output_dir / "frames.csv", index=False)
-    possessions.to_csv(args.output_dir / "possessions.csv", index=False)
+    events.to_parquet(args.output_dir / "events.parquet", engine="pyarrow", index=False)
+    frames.to_parquet(args.output_dir / "frames.parquet", engine="pyarrow", index=False)
+    possessions.to_parquet(args.output_dir / "possessions.parquet", engine="pyarrow", index=False)
     with (args.output_dir / "audit_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
 

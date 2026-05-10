@@ -24,7 +24,13 @@ def main() -> None:
     parser.add_argument("--rich", action="store_true", help="Input is rich_frames.csv; use rich feature pipeline.")
     args = parser.parse_args()
 
-    df = pd.read_csv(args.data)
+    # args.data may be a single .parquet file, a directory of parquet files
+    # (rich_frames/), or a legacy .csv. Detect by suffix.
+    data_path = Path(args.data)
+    if data_path.is_dir() or str(data_path).endswith(".parquet"):
+        df = pd.read_parquet(args.data)
+    else:
+        df = pd.read_csv(args.data)
     if args.aggregate_frames:
         if args.rich:
             df = build_rich_frame_aggregate_table(df)
