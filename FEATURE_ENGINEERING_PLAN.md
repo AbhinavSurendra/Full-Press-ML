@@ -6,14 +6,33 @@ Phases A and B are implemented and passing — 62.66% XGBoost accuracy on the me
 
 This plan covers Phase C only. Phases A and B are documented in git history and in the pipeline overview.
 
+## Status snapshot (2026-05-09)
+
+C-2 implemented and run on medium 100-game slice. C-1 plumbing in code but not yet exercised against live data (current rich_frames.csv predates C-1 plumbing — needs frames rebuild OR migrate to parquet from re-built source).
+
+| metric | pre-C-2 baseline | post-C-2 | Δ |
+|---|---|---|---|
+| accuracy | 0.6266 | **0.6477** | +2.1pp |
+| made_3 f1 | 0.37 | **0.45** | +0.08 (+21% rel) |
+| made_3 → made_2 confusion | 0.34 | **0.31** | -0.03 |
+| made_3 → missed_shot confusion | 0.18 | **0.16** | -0.02 |
+| made_2 f1 | 0.61 | 0.63 | +0.02 |
+| missed_shot f1 | 0.68 | 0.69 | +0.01 |
+| turnover f1 | 0.54 | 0.55 | +0.01 |
+| free_throws f1 | 0.84 | 0.85 | +0.01 |
+
+**pass_count_proxy leakage hypothesis CONFIRMED**: gain dropped from ~0.09 (runaway #1) to 0.028 (#4) after pre-release truncation. Most of its prior weight came from counting post-shot rebound frames.
+
+**Remaining gap**: 31% of true `made_3` still predicted as `made_2`. Model can tell a 3 from a 2 by spot, can't yet tell a Curry 3 from a JaVale 3. Direct fix = C-4 `mean_3p_pct_on_court` / `max_per_on_court`.
+
 ## Strategy decision (May 2026)
 
 After reviewing available data and weighing signal-vs-noise on the 100-game medium slice:
 
-- **Reduced C-1** is in scope for the first iteration (team_id plumbing, score margin, `is_offense_home`).
-- **C-2 is in scope** (NEW) — shot-release detection + 8 derived features (`release_dist_to_hoop`, `is_behind_three_point_arc`, etc.) added to [src/full_press_ml/features/engineer.py](src/full_press_ml/features/engineer.py). Replaces former C-2 (rest/B2B), which is now C-5. Highest-leverage gap on `made_3` per the May 2026 results audit. Pure frame-math, no external data.
-- **C-3 is in scope** — team season stats from [data/external/team_stats/](data/external/team_stats/).
-- **C-4 is in scope** (promoted from deferred) — player season stats are available at [data/external/player_stats/](data/external/player_stats/).
+- **Reduced C-1** is implemented in code (team_id plumbing, score margin, `is_offense_home`, `game_date`) but NOT yet exercised — current rich_frames.csv predates the plumbing. Effects land after a frames rebuild OR a fresh raw-JSON run.
+- **C-2 is DONE on medium** — shot-release detection + 8 derived features in [src/full_press_ml/features/engineer.py](src/full_press_ml/features/engineer.py). Lift confirmed (see Status snapshot above). Replaces former C-2 (rest/B2B), now C-5. Pure frame-math, no external data.
+- **C-3 is next** — team season stats from [data/external/team_stats/](data/external/team_stats/). Offense-only join can ship without C-1 rebuild; defense mirror requires C-1 plumbing live.
+- **C-4 is in scope** (promoted from deferred) — player season stats at [data/external/player_stats/](data/external/player_stats/). Highest expected lift on the remaining `made_3 → made_2` gap.
 - **C-5 is deferred** to the full-dataset run (former C-2 content: `rest_days`, `is_back_to_back`, `days_into_season`). On medium, `rest_days` is dominated by gaps to games NOT in the dataset → noise.
 - All Phase C features will be injected in [src/full_press_ml/features/engineer.py](src/full_press_ml/features/engineer.py) at the end of `build_rich_frame_aggregate_table()` and `build_frame_aggregate_table()`.
 
@@ -86,20 +105,22 @@ Score margin merge + team_id plumbing. `game_date` propagation is also done so C
 
 **Aggregation into features:** all listed C-1 features are possession-level constants → merge onto the possession table. Single columns (no mean/std/min/max).
 
-### C-2 — Shot-release detection + derived features (IN SCOPE, medium)
+### C-2 — Shot-release detection + derived features (DONE on medium 2026-05-09)
 
-Highest-leverage gap on `made_3`. Model currently uses `ball_z_max` as a brittle 3pt proxy because no release-point feature exists; `ball_dist_to_hoop_min` reflects post-release ball trajectory through the rim, identical for makes/misses from the same spot. Adds release-frame detection (frame-level math, no external data) plus eight derived features. Also fixes `pass_count_proxy` / `ball_dist_traveled` which currently count post-shot rebound motion across the whole possession.
+Highest-leverage gap on `made_3`. Model previously used `ball_z_max` as a brittle 3pt proxy; `ball_dist_to_hoop_min` reflects post-release ball trajectory through the rim, identical for makes/misses from the same spot. Adds release-frame detection (frame-level math, no external data) plus eight derived features. Also fixes `pass_count_proxy` / `ball_dist_traveled` which previously counted post-shot rebound motion across the whole possession.
 
-| Feature | Definition |
-|---|---|
-| `release_x`, `release_y`, `release_z` | Ball coords (ft) at detected release frame |
-| `release_dist_to_hoop` | xy distance from release point to attacking hoop |
-| `is_behind_three_point_arc` | NBA geometry: corner zone (`abs(release_y - 25) > 11`) → `abs(release_x - hoop_x) >= 22.0`; else euclidean `release_dist_to_hoop >= 23.75` |
-| `is_corner_three` | Corner zone AND behind arc |
-| `release_z_above_rim` | `release_z - 10` |
-| `release_ball_speed_xy` | Ball xy speed at release frame (jumper vs floater proxy) |
-| `frames_after_release` | `max(possession_frame_idx) - release_frame_idx` (rebound / outlet time) |
-| `nearest_defender_at_release` | Closest defender at release frame (rich frames only — closeout / contest proxy) |
+| Feature | Definition | Observed importance rank (post-C-2 run) |
+|---|---|---|
+| `release_x`, `release_y`, `release_z` | Ball coords (ft) at detected release frame | mid |
+| `release_dist_to_hoop` | xy distance from release point to attacking hoop | **#13** (0.011) |
+| `is_behind_three_point_arc` | NBA geometry: corner zone (`abs(release_y - 25) > 11`) → `abs(release_x - hoop_x) >= 22.0`; else euclidean `release_dist_to_hoop >= 23.75` | mid |
+| `is_corner_three` | Corner zone AND behind arc | **#6** (0.024) |
+| `release_z_above_rim` | `release_z - 10` | mid |
+| `release_ball_speed_xy` | Ball xy speed at release frame (jumper vs floater proxy) | low |
+| `frames_after_release` | `max(possession_frame_idx) - release_frame_idx` (rebound / outlet time) | **#1** (0.0345) — see caveat |
+| `nearest_defender_at_release` | Closest defender at release frame (rich frames only — closeout / contest proxy) | **#5** (0.027) |
+
+**`frames_after_release` caveat**: this feature captures outcome via post-shot ball physics — makes end fast (clock stops on score), misses linger (rebound flight + put-back attempts). Detector consumes only ball x/y/z + `possession_frame_idx`, never `terminal_label`, so it's not technically leakage. But its #1 ranking means it's carrying outcome-correlated signal that emerged from physics rather than pre-shot context. Worth an **ablation run** (drop the column, retrain) to see how much of the +2.1pp lift came from this single feature versus the rest of the release block. If most of the lift travels with `frames_after_release`, the gain is real but narrowly anchored.
 
 **Detection algorithm** (per possession, no label peek):
 
@@ -110,6 +131,8 @@ Highest-leverage gap on `made_3`. Model currently uses `ball_z_max` as a brittle
 **Free-throw gating** (structural — no `terminal_label` peek): `shot_clock` null across the whole possession OR `ball_x` std < 1 ft for 25+ frames before apex with `ball_x_start` within ±2 ft of FT line (`x ∈ {19, 75}`) → all release features NaN.
 
 **`pass_count_proxy` / `ball_dist_traveled` fix**: aggregate `ball_step_dist` only over `possession_frame_idx <= release_frame_idx`. Possessions with NaN release fall back to whole possession (current behaviour). Same column names; semantics narrow to pre-release for shooting possessions.
+
+**Outcome — leakage hypothesis CONFIRMED on 2026-05-09**: `pass_count_proxy` gain dropped from ~0.09 (runaway #1, ~3× next) to 0.028 (#4). Most of its prior weight came from counting post-shot rebound and outlet motion. The pre-release truncation removed that inflation; the residual gain is now defensibly pre-shot signal (passes leading into the release).
 
 **Leakage guard**: release detection consumes only ball x/y/z and `possession_frame_idx`. No PBP, no `terminal_label`. Verify `release_dist_to_hoop` for known made-3 events ≥ 22 ft.
 
@@ -283,12 +306,21 @@ python -m full_press_ml.training.train_baseline \
 # Expect small but consistent lift. Watch score_margin_at_start, is_offense_home
 # land in the importance table.
 
-# After C-2 (shot release):
-# Expect biggest lift on made_3 f1 (currently 0.37) and reduction of made_3→made_2
-# confusion (currently 0.34). release_dist_to_hoop, is_behind_three_point_arc,
-# release_z should land in top-15 importance. pass_count_proxy gain should drop
-# (no longer counting post-shot frames). made_3 calibration curve should extend
-# further right (currently dies at ~0.55 mean prob).
+# After C-2 (shot release) — CONFIRMED on medium 2026-05-09:
+# accuracy 0.6266 → 0.6477 (+2.1pp). made_3 f1 0.37 → 0.45 (+0.08, +21% rel).
+# made_3→made_2 confusion 0.34 → 0.31. made_3→missed_shot 0.18 → 0.16.
+# Top-importance landings:
+#   frames_after_release      #1 (0.0345)  — see caveat below
+#   nearest_defender_at_release  #5 (0.027)
+#   is_corner_three           #6 (0.024)
+#   release_dist_to_hoop      #13 (0.011)
+# pass_count_proxy demoted from #1 (~0.09 gain) to #4 (0.028) — confirms the
+# pre-truncation hypothesis: most of its prior weight came from post-shot
+# rebound frames.
+# CAVEAT: frames_after_release captures outcome via post-shot ball physics
+# (makes end fast, misses linger). Detector never reads terminal_label so it's
+# not technically leakage, but worth an ablation run to see how much of the
+# +2.1pp lift it personally carried.
 
 # After C-3 (team CSVs joined):
 # Expect further lift on made_3 f1. Team pace and 3PA rate should land
@@ -318,10 +350,24 @@ Spot checks:
 
 ## Recommended ordering (current iteration)
 
-1. **Reduced C-1** — half day; team_id plumbing + score margin + `is_offense_home`. `game_date` plumbed but unused on medium (feeds C-5 later).
-2. **C-2 (shot release)** — half day; pure frame-math, no external data. Targets weak `made_3` directly, also fixes suspected `pass_count_proxy` post-shot-frame leakage. No ID maps required → cheapest big-impact step.
+**Done**:
+1. **C-2 (shot release)** — DONE 2026-05-09. +2.1pp accuracy, made_3 f1 0.37 → 0.45.
+
+**Decision branch from here**:
+
+- **Cheap path** (no frames rebuild): ship **C-3 offense-only** + **C-4 offense-only** against the existing rich_frames. Skip the defense mirror (which needs `home_team_id` / `away_team_id` per-frame from C-1). Loses ~half the season-stat lift but costs zero rebuild time.
+- **Full path** (one frames rebuild): rerun [build_rich_tracking](src/full_press_ml/data/build_rich_tracking.py) so the C-1 plumbing populates `home_team_id`, `away_team_id`, `game_date`, `score_margin_at_start`, `is_offense_home`, `offense_score_diff_at_start`. Slow (~hour). After that:
+  - **Reduced C-1 features** (`score_margin_at_start`, `is_offense_home`) become live → small but real lift.
+  - **C-3 + C-4 with defense mirror** (offense + defense team / player joins) → higher ceiling on `made_3` (~half the season-stat lift comes from defense side).
+  - **C-5** unlocks for full-dataset run only.
+
+**Recommended sequence** if going full path:
+1. Rebuild rich frames (now writes parquet directory natively per the parquet swap).
+2. **Reduced C-1** features land automatically — first re-train measures the C-1 lift in isolation.
 3. **C-3** — half day; needs `team_id_map.csv` (auto-scaffold + verify).
-4. **C-4** — day; needs `player_id_map.csv` via fuzzy match + ~15 min hand verification. Highest expected made_3 lift among season-stat joins.
+4. **C-4** — day; needs `player_id_map.csv` via fuzzy match + ~15 min hand verification. Highest expected made_3 lift among season-stat joins. Targets the remaining 31% `made_3 → made_2` confusion via `mean_3p_pct_on_court` / `max_per_on_court`.
 5. **C-5** — re-enable on full-dataset run only. Skipped on medium.
+
+**Recommended sequence** if going cheap path: C-3 offense-only → C-4 offense-only. ~1 day total. Defer the rebuild.
 
 After each stage, re-run medium and diff the feature importance table — the point isn't just overall accuracy, it's identifying *which* context signals land.
