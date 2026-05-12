@@ -23,5 +23,6 @@ checkpoints/
 artifacts/
 data/raw/*
 data/processed/*
+data/external/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
