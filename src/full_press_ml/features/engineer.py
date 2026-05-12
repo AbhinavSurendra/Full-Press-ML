@@ -71,6 +71,7 @@ def add_basic_tracking_features(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     if "shot_clock" in feature_df.columns:
+        feature_df["shot_clock"] = pd.to_numeric(feature_df["shot_clock"], errors="coerce")
         feature_df["shot_clock_low"] = (feature_df["shot_clock"] <= 6).astype(int)
 
     # --- NEW: shot clock bucket -------------------------------------------
